@@ -1,0 +1,227 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Servo.h>
+#include <SoftwareSerial.h>
+
+// ===== PINS =====
+const int ENA=5, IN1=2, IN2=4, ENB=6, IN3=7, IN4=8;
+const int IR_PIN=9;
+#define RC522_SS 10
+MFRC522 mfrc(RC522_SS, MFRC522::UNUSED_PIN);
+SoftwareSerial esp(A0, A5);  // RX=A0 from ESP32 TX2, TX unused
+#define DONE_PIN A1
+
+#define SERVO_BASE_PIN     A3
+#define SERVO_SHOULDER_PIN 3
+#define SERVO_ELBOW_PIN    A4
+#define SERVO_GRIP_PIN     A2
+
+// ===== Behaviour =====
+int motorSpeed = 70;
+const bool IR_LOW_IS_BLACK = true;
+const unsigned long START_DELAY_MS=5000;
+const unsigned long HALT_TIME_MS=10000;
+const unsigned long KICK_MS=500;
+const unsigned long RFID_COOLDOWN_MS=1500;
+const unsigned long FIND_BLACK_TIMEOUT=4000;
+const int LEFT_FWD_DIR=+1, RIGHT_FWD_DIR=+1;
+
+const int SERVO_US_MIN=500, SERVO_US_MAX=2400;
+int BASE_FORWARD=90, BASE_LEFT=130, BASE_REAR=30;
+int SHOULDER_UP=100, SHOULDER_DOWN=65;
+int ELBOW_IN=120, ELBOW_OUT=80;
+int GRIP_OPEN_US=1500, GRIP_CLOSE_US=900;
+
+Servo sBase,sShoulder,sElbow,sGrip;
+
+// ===== Order (by UID) =====
+const int MAX_ITEMS=12;
+byte targets[MAX_ITEMS][4]; // UIDs to collect
+int  need[MAX_ITEMS];       // qty per UID
+int  N=0;
+
+enum State {IDLE, START_DELAY, FOLLOW_LINE, FIND_LINE, FINISHED};
+State st=IDLE;
+
+String rx;
+unsigned long tState=0, rfidEnableAt=0;
+byte lastUID[4]={0,0,0,0}; unsigned long lastSeenAt=0;
+
+// ===== Helpers =====
+inline bool irOnBlack(){int v=digitalRead(IR_PIN); return IR_LOW_IS_BLACK?(v==LOW):(v==HIGH);}
+inline void setLeft(int pwm){pwm=constrain(pwm,-255,255)*LEFT_FWD_DIR; if(pwm>=0){digitalWrite(IN1,HIGH);digitalWrite(IN2,LOW);analogWrite(ENA,pwm);}else{digitalWrite(IN1,LOW);digitalWrite(IN2,HIGH);analogWrite(ENA,-pwm);} }
+inline void setRight(int pwm){pwm=constrain(pwm,-255,255)*RIGHT_FWD_DIR; if(pwm>=0){digitalWrite(IN3,HIGH);digitalWrite(IN4,LOW);analogWrite(ENB,pwm);}else{digitalWrite(IN3,LOW);digitalWrite(IN4,HIGH);analogWrite(ENB,-pwm);} }
+inline void motors(int l,int r){setLeft(l);setRight(r);}
+inline void stopMotors(){analogWrite(ENA,0);analogWrite(ENB,0);digitalWrite(IN1,LOW);digitalWrite(IN2,LOW);digitalWrite(IN3,LOW);digitalWrite(IN4,LOW);}
+
+bool uidEq(const byte a[4], const byte b[4]){for(byte i=0;i<4;i++) if(a[i]!=b[i]) return false; return true;}
+int  findTarget(const byte uid[4]){for(int i=0;i<N;i++) if(need[i]>0 && uidEq(uid,targets[i])) return i; return -1;}
+bool allDone(){if(N==0) return false; for(int i=0;i<N;i++) if(need[i]>0) return false; return true;}
+
+void sendDone(){pinMode(DONE_PIN,OUTPUT);digitalWrite(DONE_PIN,LOW);delay(200);pinMode(DONE_PIN,INPUT);}
+
+void attachServos(){sBase.attach(SERVO_BASE_PIN,SERVO_US_MIN,SERVO_US_MAX);sShoulder.attach(SERVO_SHOULDER_PIN,SERVO_US_MIN,SERVO_US_MAX);sElbow.attach(SERVO_ELBOW_PIN,SERVO_US_MIN,SERVO_US_MAX);sGrip.attach(SERVO_GRIP_PIN,SERVO_US_MIN,SERVO_US_MAX);}
+void detachServos(){sBase.detach();sShoulder.detach();sElbow.detach();sGrip.detach();}
+void armHome(){sBase.write(BASE_FORWARD);sShoulder.write(SHOULDER_UP);sElbow.write(ELBOW_IN);sGrip.writeMicroseconds(GRIP_OPEN_US);delay(250);}
+void gripSqueeze(){int u=GRIP_CLOSE_US;for(int k=0;k<3;k++){sGrip.writeMicroseconds(u);delay(150);sGrip.writeMicroseconds(u+60);delay(100);sGrip.writeMicroseconds(u);} }
+void armPickAndDropAll(int idx){
+  attachServos(); armHome();
+  while(need[idx]>0){
+    sBase.write(BASE_LEFT); delay(220);
+    sShoulder.write(SHOULDER_DOWN); delay(260);
+    sElbow.write(ELBOW_OUT); delay(260);
+    gripSqueeze();
+    sElbow.write(ELBOW_IN); delay(260);
+    sShoulder.write(SHOULDER_UP); delay(300);
+    sBase.write(BASE_REAR); delay(260);
+    sGrip.writeMicroseconds(GRIP_OPEN_US); delay(220);
+    armHome();
+    need[idx]--;
+  }
+  detachServos();
+}
+
+void leaveTagKick(){unsigned long t0=millis(); while(millis()-t0<KICK_MS){motors(motorSpeed,motorSpeed);delay(10);} stopMotors(); rfidEnableAt=millis()+RFID_COOLDOWN_MS;}
+
+bool reacquireBlack(){
+  unsigned long t0=millis(), tSeek=0; bool left=true;
+  while(millis()-t0<FIND_BLACK_TIMEOUT){
+    if(irOnBlack()) return true;
+    stopMotors();
+    if(millis()-tSeek>200){tSeek=millis();left=!left;}
+    if(left) motors(motorSpeed/3,motorSpeed); else motors(motorSpeed,motorSpeed/3);
+    delay(10);
+  }
+  stopMotors(); return false;
+}
+
+// Parse "ORDERUID:12:D3:D6:05x1,63:9C:71:E4x2,..."
+void parseOrderUID(const String& line){
+  N=0; for(int i=0;i<MAX_ITEMS;i++) need[i]=0;
+  String s=line; s.trim(); if(!s.startsWith("ORDERUID:")) return; s.remove(0,9);
+  int pos=0;
+  while(pos<(int)s.length()){
+    int comma=s.indexOf(',',pos);
+    String tok=(comma==-1)? s.substring(pos): s.substring(pos,comma);
+    tok.trim();
+    if(tok.length()){
+      int x=tok.lastIndexOf('x'); // UID 'xx:xx:xx:xx'xQTY
+      if(x>0){
+        String uidStr=tok.substring(0,x); uidStr.trim();
+        int qty=tok.substring(x+1).toInt(); if(qty<1) qty=1;
+        // parse UID
+        byte uid[4]={0,0,0,0}; int ui=0; int p=0;
+        while(ui<4 && p<uidStr.length()){
+          int col=uidStr.indexOf(':',p);
+          String h=(col==-1)? uidStr.substring(p) : uidStr.substring(p,col);
+          uid[ui++]=(byte) strtol(h.c_str(), nullptr, 16);
+          if(col==-1) break; p=col+1;
+        }
+        if(ui==4){
+          // merge if same UID already present
+          bool merged=false;
+          for(int k=0;k<N;k++){
+            if(uidEq(uid,targets[k])){ need[k]+=qty; merged=true; break; }
+          }
+          if(!merged && N<MAX_ITEMS){
+            memcpy(targets[N],uid,4); need[N]=qty; N++;
+          }
+        }
+      }
+    }
+    if(comma==-1) break; else pos=comma+1;
+  }
+  Serial.print(F("[UNO] Parsed UID items: ")); Serial.println(N);
+}
+
+// Backward compatibility: also accept old "ORDER:name:qty,..."
+void parseOrderByName(const String& line){
+  // not used now, but kept in case you test old firmware
+  (void)line; N=0;
+}
+
+// ===== Setup / Loop =====
+void setup(){
+  Serial.begin(115200);
+  esp.begin(9600);
+  pinMode(ENA,OUTPUT); pinMode(ENB,OUTPUT);
+  pinMode(IN1,OUTPUT); pinMode(IN2,OUTPUT); pinMode(IN3,OUTPUT); pinMode(IN4,OUTPUT);
+  pinMode(IR_PIN,INPUT_PULLUP); pinMode(DONE_PIN,INPUT);
+  SPI.begin(); mfrc.PCD_Init(); // RST tied high
+
+  // prove servo power
+  sGrip.attach(SERVO_GRIP_PIN,SERVO_US_MIN,SERVO_US_MAX);
+  sGrip.writeMicroseconds(GRIP_OPEN_US); delay(120);
+  sGrip.writeMicroseconds(GRIP_CLOSE_US); delay(120);
+  sGrip.writeMicroseconds(GRIP_OPEN_US); delay(120);
+  sGrip.detach();
+
+  stopMotors();
+  Serial.println(F("[UNO] Ready. Waiting ORDERUID on A0 ..."));
+}
+
+void loop(){
+  // receive a line from ESP32
+  while(esp.available()){
+    char c=esp.read();
+    if(c=='\n'){
+      rx.trim();
+      if(rx.startsWith("ORDERUID:")){ parseOrderUID(rx); if(N>0){st=START_DELAY;tState=millis();rfidEnableAt=0;} }
+      else if(rx.startsWith("ORDER:")){ parseOrderByName(rx); if(N>0){st=START_DELAY;tState=millis();rfidEnableAt=0;} }
+      rx="";
+    }else rx+=c;
+  }
+
+  switch(st){
+    case IDLE: stopMotors(); break;
+
+    case START_DELAY:
+      stopMotors();
+      if(millis()-tState>=START_DELAY_MS){ st=FOLLOW_LINE; Serial.println(F("[UNO] Start following line...")); }
+      break;
+
+    case FOLLOW_LINE: {
+      // Always poll RFID so we stop immediately on a matched tag
+      if(millis()>=rfidEnableAt){
+        if(mfrc.PICC_IsNewCardPresent() && mfrc.PICC_ReadCardSerial()){
+          byte uid[4]={0,0,0,0}; for(byte i=0;i<mfrc.uid.size && i<4;i++) uid[i]=mfrc.uid.uidByte[i];
+          int idx=findTarget(uid);
+          mfrc.PICC_HaltA(); mfrc.PCD_StopCrypto1();
+
+          if(idx>=0){
+            stopMotors();
+            Serial.print(F("[UNO] Tag matched slot ")); Serial.println(idx);
+            unsigned long tHalt=millis();
+            armPickAndDropAll(idx);
+            unsigned long used=millis()-tHalt;
+            if(used<HALT_TIME_MS) delay(HALT_TIME_MS-used);
+            leaveTagKick();
+            st=FIND_LINE;
+            break;
+          }
+        }
+      }
+
+      // Line following (your accepted behaviour)
+      static bool seekLeft=true; static unsigned long tSeek=0;
+      if(irOnBlack()){ motors(motorSpeed,motorSpeed); }
+      else{
+        stopMotors();
+        if(millis()-tSeek>200){ tSeek=millis(); seekLeft=!seekLeft; }
+        if(seekLeft) motors(motorSpeed/3,motorSpeed); else motors(motorSpeed,motorSpeed/3);
+      }
+
+      if(allDone()){
+        stopMotors(); attachServos(); armHome(); detachServos();
+        sendDone(); st=FINISHED; Serial.println(F("[UNO] DONE -> pulse to ESP32"));
+      }
+    } break;
+
+    case FIND_LINE:
+      if(reacquireBlack()) st=FOLLOW_LINE;
+      else { stopMotors(); st=IDLE; Serial.println(F("[UNO] Line lost; waiting.")); }
+      break;
+
+    case FINISHED: stopMotors(); break;
+  }
+}
